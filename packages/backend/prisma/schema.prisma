@@ -1,0 +1,377 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum TradingFirm {
+  TOPSTEPX
+  ALPHA_FUTURES
+  MYFUNDED_FUTURES
+  TAKEPROFIT_TRADER
+  TRADEFY
+}
+
+enum Platform {
+  RITHMIC
+  TRADOVATE
+  NINJATRADER
+  PROJECTX
+  OTHER
+}
+
+enum CopierStatus {
+  ACTIVE
+  PAUSED
+  STOPPED
+  ERROR
+}
+
+enum TradeType {
+  MARKET
+  LIMIT
+  STOP
+}
+
+enum TradeSide {
+  BUY
+  SELL
+}
+
+enum TradeStatus {
+  PENDING
+  FILLED
+  PARTIALLY_FILLED
+  CANCELLED
+  REJECTED
+}
+
+enum RiskScalingType {
+  FIXED
+  PERCENTAGE
+  BALANCE_BASED
+}
+
+// ========== USER & ORGANIZATION ==========
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  firstName String?
+  lastName  String?
+  role      UserRole @default(USER)
+  mfaEnabled Boolean @default(false)
+  mfaSecret String?
+  
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  
+  tradingAccounts TradingAccount[]
+  copiers         Copier[]
+  transactions    Transaction[]       @relation("UserTransactions")
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+  @@index([organizationId])
+}
+
+model Organization {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  plan        String   @default("free") // free, pro, enterprise
+  stripeCustomerId String?
+  
+  users       User[]
+  copiers     Copier[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([slug])
+}
+
+// ========== TRADING ACCOUNTS ==========
+
+model TradingAccount {
+  id              String       @id @default(cuid())
+  userId          String
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  name            String
+  firm            TradingFirm
+  platform        Platform
+  accountNumber   String
+  accountSize     Float        // Account size in USD
+  currentBalance  Float        @default(0)
+  
+  // Connection credentials (encrypted in real implementation)
+  email           String?      // Email for login (encrypted)
+  password        String?      // Password for login (encrypted)
+  apiKey          String?      // API Key if needed (encrypted)
+  apiSecret       String?      // API Secret if needed (encrypted)
+  additionalConfig Json?       // Platform-specific config
+  
+  // Risk limits
+  maxDrawdown     Float?       // Maximum drawdown percentage
+  dailyLossLimit  Float?       // Daily loss limit in USD
+  
+  // Status
+  isConnected     Boolean      @default(false)
+  lastSyncAt      DateTime?
+  errorMessage    String?
+  
+  // Relations
+  masterCopiers   Copier[]     @relation("MasterAccount")
+  slaveConfigs    CopierAccountConfig[]
+  trades          Trade[]
+  transactions    Transaction[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([firm])
+  @@index([accountNumber])
+}
+
+// ========== COPIER CONFIGURATION ==========
+
+model Copier {
+  id            String         @id @default(cuid())
+  userId        String
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  
+  name          String
+  masterAccountId String
+  masterAccount TradingAccount @relation("MasterAccount", fields: [masterAccountId], references: [id])
+  
+  status        CopierStatus   @default(STOPPED)
+  latencyToleranceMs Int       @default(1000) // Max latency in ms
+  
+  // Settings
+  copyEntries   Boolean        @default(true)
+  copyExits     Boolean        @default(true)
+  copyModifications Boolean    @default(true) // SL/TP moves, break-even
+  
+  // Relations
+  slaveConfigs  CopierAccountConfig[]
+  trades        Trade[]
+  tradeMappings TradeMapping[]
+  executionLogs ExecutionLog[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([masterAccountId])
+  @@index([status])
+}
+
+model CopierAccountConfig {
+  id              String       @id @default(cuid())
+  copierId        String
+  copier          Copier       @relation(fields: [copierId], references: [id], onDelete: Cascade)
+  
+  slaveAccountId  String
+  slaveAccount    TradingAccount @relation(fields: [slaveAccountId], references: [id], onDelete: Cascade)
+  
+  // Risk scaling
+  scalingType     RiskScalingType @default(FIXED)
+  fixedContracts  Int?          // For FIXED scaling
+  percentageScale Float?         // For PERCENTAGE scaling (e.g., 0.5 = 50%)
+  maxContracts    Int?          // Maximum contracts cap
+  
+  // Protection rules
+  dailyLossLimit  Float?       // Override copier if daily loss exceeded
+  autoDisable     Boolean      @default(true) // Auto-disable on rule breach
+  
+  // Status
+  isActive        Boolean      @default(true)
+  disabledReason  String?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([copierId, slaveAccountId])
+  @@index([copierId])
+  @@index([slaveAccountId])
+}
+
+// ========== TRADES & EXECUTION ==========
+
+model Trade {
+  id              String       @id @default(cuid())
+  copierId        String?
+  copier          Copier?      @relation(fields: [copierId], references: [id])
+  
+  accountId       String
+  account         TradingAccount @relation(fields: [accountId], references: [id])
+  
+  // Trade details
+  symbol          String
+  side            TradeSide
+  type            TradeType
+  quantity        Int          // Number of contracts
+  
+  entryPrice      Float?
+  exitPrice       Float?
+  stopLoss        Float?
+  takeProfit      Float?
+  
+  status          TradeStatus  @default(PENDING)
+  
+  // Timing
+  openedAt        DateTime?
+  closedAt        DateTime?
+  filledAt        DateTime?
+  
+  // PnL
+  realizedPnL     Float?       @default(0)
+  
+  // External references
+  externalOrderId String?      // Order ID from trading platform
+  externalTradeId String?      // Trade ID from trading platform
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([copierId])
+  @@index([accountId])
+  @@index([status])
+  @@index([symbol])
+  @@index([externalOrderId])
+}
+
+model TradeMapping {
+  id                String   @id @default(cuid())
+  copierId          String
+  copier            Copier   @relation(fields: [copierId], references: [id], onDelete: Cascade)
+  
+  masterTradeId     String   // Reference to master trade
+  slaveTradeId      String   // Reference to slave trade
+  slaveAccountId    String
+  
+  status            String   @default("pending") // pending, synced, failed
+  
+  syncedAt          DateTime?
+  errorMessage      String?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([copierId])
+  @@index([masterTradeId])
+  @@index([slaveTradeId])
+  @@unique([masterTradeId, slaveAccountId])
+}
+
+// ========== RISK RULES ==========
+
+model RiskRule {
+  id              String   @id @default(cuid())
+  copierConfigId  String   // References CopierAccountConfig
+  ruleType        String   // daily_loss, drawdown, max_contracts, etc.
+  threshold       Float
+  action          String   // disable_copier, notify, etc.
+  
+  isActive        Boolean  @default(true)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([copierConfigId])
+}
+
+// ========== EXECUTION LOGS ==========
+
+model ExecutionLog {
+  id              String   @id @default(cuid())
+  copierId        String
+  copier          Copier   @relation(fields: [copierId], references: [id], onDelete: Cascade)
+  
+  level           String   // info, warning, error
+  message         String
+  details         Json?    // Additional context
+  
+  masterTradeId   String?
+  slaveTradeId    String?
+  slaveAccountId  String?
+  
+  createdAt DateTime @default(now())
+
+  @@index([copierId])
+  @@index([level])
+  @@index([createdAt])
+}
+
+// ========== ACCOUNTING / CONTABILIDAD ==========
+
+enum TransactionType {
+  ACCOUNT_PURCHASE  // Compra de cuenta fondeada
+  EXAM_FEE         // Costo de examen/evaluación de cuenta
+  WITHDRAWAL        // Retiro de dinero
+  REFUND            // Reembolso
+  DEPOSIT           // Depósito (si aplica)
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+model Transaction {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation("UserTransactions", fields: [userId], references: [id], onDelete: Cascade)
+  
+  type            TransactionType
+  status          TransactionStatus @default(PENDING)
+  
+  // Financial details
+  amount          Float              // Monto en USD (positivo para ingresos, negativo para gastos)
+  currency        String   @default("USD")
+  
+  // Related to account purchase
+  tradingAccountId String?            // Si es compra de cuenta, referencia a la cuenta
+  tradingAccount   TradingAccount?    @relation(fields: [tradingAccountId], references: [id])
+  
+  firm            TradingFirm?        // Firma de la cuenta comprada
+  
+  // Metadata
+  description     String?             // Descripción de la transacción
+  notes           String?             // Notas adicionales
+  externalId      String?             // ID externo (factura, etc.)
+  
+  // Dates
+  transactionDate DateTime @default(now())
+  completedAt     DateTime?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([type])
+  @@index([status])
+  @@index([transactionDate])
+  @@index([tradingAccountId])
+}
